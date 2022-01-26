@@ -57,6 +57,8 @@ static char *radius[] = {
 
 static char *idp[] = {
     "ipaidpClientID",
+    "ipaidpAuthEndpoint",
+    "ipaidpTokenEndpoint",
     "ipaidpIssuerURL",
     NULL
 };
@@ -195,10 +197,13 @@ static enum oauth2_state get_oauth2_state(enum ldap_query ldap_query,
         }
     } else if (ldap_query == LDAP_QUERY_IDP) {
         /* Check the idp entry for required attributes */
-        if (item->idp.ipaidpIssuerURL == NULL) {
+        if (item->idp.ipaidpIssuerURL == NULL
+                && (item->idp.ipaidpAuthEndpoint == NULL
+                        || item->idp.ipaidpTokenEndpoint == NULL)) {
             oauth2_state = OAUTH2_NO;
             otpd_log_req(item->req,
-                         "OAuth2 not possible, Missing issuer URL in idp entry");
+                         "OAuth2 not possible, Missing issuer URL and "
+                         "endpoints in idp entry");
         }
         if (item->idp.ipaidpClientID == NULL) {
             oauth2_state = OAUTH2_NO;
@@ -310,8 +315,10 @@ static void on_query_readable(verto_ctx *vctx, verto_ev *ev)
         break;
     case LDAP_QUERY_IDP:
         otpd_log_req(item->req, "idp query end: %s",
-                item->error == NULL ? item->idp.ipaidpIssuerURL : item->error);
-        if (item->idp.ipaidpIssuerURL == NULL
+                item->error == NULL ? item->idp.ipaidpClientID : item->error);
+        if ((item->idp.ipaidpIssuerURL == NULL
+                && (item->idp.ipaidpAuthEndpoint == NULL
+                        || item->idp.ipaidpTokenEndpoint == NULL)) 
                     || item->idp.ipaidpClientID == NULL) {
             goto egress;
         }

@@ -204,19 +204,29 @@ const char *otpd_parse_user(LDAP *ldp, LDAPMessage *entry,
 const char *otpd_parse_idp(LDAP *ldp, LDAPMessage *entry,
                               struct otpd_queue_item *item)
 {
-  int i;
+    int i;
 
-  i = get_string(ldp, entry, "ipaidpIssuerURL", &item->idp.ipaidpIssuerURL);
-  if (i != 0) {
-      return strerror(i);
-  }
+    i = get_string(ldp, entry, "ipaidpClientID", &item->idp.ipaidpClientID);
+    if (i != 0) {
+        return strerror(i);
+    }
 
-  i = get_string(ldp, entry, "ipaidpClientID", &item->idp.ipaidpClientID);
-  if (i != 0) {
-      return strerror(i);
-  }
+    i = get_string(ldp, entry, "ipaidpIssuerURL", &item->idp.ipaidpIssuerURL);
+    if (i == 0) {
+        return NULL;
+    } else if (i == ENOENT) {
+        i = get_string(ldp, entry, "ipaidpAuthEndpoint",
+                       &item->idp.ipaidpAuthEndpoint);
+        if (i == 0) {
+            i = get_string(ldp, entry, "ipaidpTokenEndpoint",
+                           &item->idp.ipaidpTokenEndpoint);
+            if (i == 0) {
+                return NULL;
+            }
+        }
+    }
 
-  return NULL;
+    return strerror(i);
 }
 
 /* Parse the user's RADIUS configuration. */

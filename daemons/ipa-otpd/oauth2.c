@@ -352,7 +352,9 @@ int oauth2(struct otpd_queue_item **item, enum oauth2_state oauth2_state)
     int pipefd_to_child[2] = { -1, -1};
     int pipefd_from_child[2] = { -1, -1};
     struct child_ctx *child_ctx;
-    char *args[] = {OIDC_CHILD_PATH, NULL, "--issuer-url", NULL, "--client-id", NULL, "-d", "10", "--libcurl-debug", NULL};
+    char **args = NULL;
+    char *args_url[] = {OIDC_CHILD_PATH, NULL, "--client-id", NULL, "--issuer-url", NULL, "-d", "10", "--libcurl-debug", NULL};
+    char *args_ep[] = {OIDC_CHILD_PATH, NULL, "--client-id", NULL, "--device-auth-endpoint", NULL, "--token-endpoint", NULL, "-d", "10", "--libcurl-debug", NULL};
     const krb5_data *data_state;
     struct otpd_queue_item *saved_item;
 
@@ -419,13 +421,23 @@ int oauth2(struct otpd_queue_item **item, enum oauth2_state oauth2_state)
     otpd_log_req((*item)->req, "oauth2 start: %s",
                                oauth2_state_to_str(oauth2_state));
 
+    if ((*item)->idp.ipaidpIssuerURL != NULL) {
+        args = args_url;
+        args[5] = (*item)->idp.ipaidpIssuerURL;
+    } else {
+        args = args_ep;
+        args[5] = (*item)->idp.ipaidpAuthEndpoint;
+        args[7] = (*item)->idp.ipaidpTokenEndpoint;
+    }
+
     if (oauth2_state == OAUTH2_GET_DEVICE_CODE) {
         args[1] = "--get-device-code";
     } else {
         args[1] = "--get-access-token";
     }
-    args[3] = (*item)->idp.ipaidpIssuerURL;
-    args[5] = (*item)->idp.ipaidpClientID;
+    
+    args[3] = (*item)->idp.ipaidpClientID;
+    
 
     ret = pipe(pipefd_from_child);
     if (ret == -1) {

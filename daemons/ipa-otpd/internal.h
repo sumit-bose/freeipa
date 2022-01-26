@@ -80,6 +80,8 @@ struct otpd_queue_item {
     } radius;
 
     struct {
+        char *ipaidpAuthEndpoint;
+        char *ipaidpTokenEndpoint;
         char *ipaidpIssuerURL;
         char *ipaidpClientID;
     } idp;

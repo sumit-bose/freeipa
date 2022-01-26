@@ -343,4 +343,3 @@ error:
     krb5_free_context(ctx.kctx);
     return ctx.exitstatus;
 }
-
