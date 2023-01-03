@@ -86,6 +86,39 @@ static bool auth_type_is(char **auth_types, const char *check)
     return false;
 }
 
+#define PASSKEY_PREFIX "passkey "
+
+static bool is_passkey(struct otpd_queue_item *item)
+{
+    const krb5_data *data_pwd;
+    const krb5_data *data_state;
+    int ret;
+
+    data_pwd = krad_packet_get_attr(item->req,
+                                    krad_attr_name2num("User-Password"), 0);
+    data_state = krad_packet_get_attr(item->req,
+                                      krad_attr_name2num("Proxy-State"), 0);
+
+    if (data_pwd == NULL && data_state != NULL
+            && data_state->length > strlen(PASSKEY_PREFIX)
+            && strncmp(data_state->data, PASSKEY_PREFIX,
+                       strlen(PASSKEY_PREFIX)) == 0
+            && auth_type_is(item->user.ipauserauthtypes, "passkey")) {
+
+        ret = passkey_parse_data(data_state->data + strlen(PASSKEY_PREFIX),
+                                 data_state->length - strlen(PASSKEY_PREFIX) - 1,
+                                 item);
+        if (ret != 0) {
+            return false;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+#define PASSKEY_CONFIG_FILTER "(objectclass=ipapasskeyconfigobject)"
+
 /* Send queued LDAP requests to the server. */
 static void on_query_writable(verto_ctx *vctx, verto_ev *ev)
 {
@@ -121,6 +154,14 @@ static void on_query_writable(verto_ctx *vctx, verto_ev *ev)
                             LDAP_SCOPE_SUBTREE, filter, user, 0, NULL,
                             NULL, NULL, 1, &item->msgid);
         free(filter);
+
+    } else if (item->get_passkey_config) {
+        otpd_log_req(item->req, "passkey config query start:");
+        item->ldap_query = LDAP_QUERY_PASSKEY;
+
+        i = ldap_search_ext(verto_get_private(ev), ctx.query.base,
+                            LDAP_SCOPE_SUBTREE, PASSKEY_CONFIG_FILTER, user, 0, NULL,
+                            NULL, NULL, 1, &item->msgid);
 
     } else if (auth_type_is(item->user.ipauserauthtypes, "idp")) {
         otpd_log_req(item->req, "idp query start: %s",
@@ -283,6 +324,9 @@ static void on_query_readable(verto_ctx *vctx, verto_ev *ev)
         case LDAP_QUERY_IDP:
             err = otpd_parse_idp(ldp, entry, item);
             break;
+        case LDAP_QUERY_PASSKEY:
+            err = otpd_parse_passkey(ldp, entry, item);
+            break;
         default:
             ldap_msgfree(entry);
             goto egress;
@@ -331,8 +375,33 @@ static void on_query_readable(verto_ctx *vctx, verto_ev *ev)
             goto egress;
         }
         break;
+    case LDAP_QUERY_PASSKEY:
+        otpd_log_req(item->req, "passkey query end: %s",
+                item->error == NULL ? "ok" : item->error);
+        if (item->passkey == NULL) {
+            goto egress;
+        }
+        break;
     default:
         goto egress;
+    }
+
+    /* Check for passkey */
+    if (is_passkey(item)) {
+        if (item->ldap_query == LDAP_QUERY_USER) {
+            item->get_passkey_config = true;
+
+            push = &ctx.query.requests;
+            event = ctx.query.io;
+            goto egress;
+        }
+
+        i = do_passkey(item);
+        if (i != 0) {
+            goto egress;
+        }
+        /* do_passkey will call ctx.stdio.writer, so we can return here */
+        return;
     }
 
     /* Check for oauth2 */

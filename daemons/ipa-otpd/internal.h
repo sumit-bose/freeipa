@@ -24,6 +24,8 @@
 
 #include "krad.h"
 
+#include <stdbool.h>
+
 #include <ldap.h>
 
 #include <errno.h>
@@ -49,6 +51,7 @@ enum ldap_query {
     LDAP_QUERY_RADIUS,
     LDAP_QUERY_RADIUS_USERMAP,
     LDAP_QUERY_IDP,
+    LDAP_QUERY_PASSKEY,
     LDAP_QUERY_END
 };
 
@@ -58,6 +61,8 @@ enum oauth2_state {
     OAUTH2_GET_DEVICE_CODE,
     OAUTH2_GET_ACCESS_TOKEN
 };
+
+struct otpd_queue_item_passkey;
 
 struct otpd_queue_item {
     struct otpd_queue_item *next;
@@ -74,6 +79,7 @@ struct otpd_queue_item {
         char *ipatokenRadiusConfigLink;
         char *ipaidpSub;
         char *ipaidpConfigLink;
+        char **ipaPassKey;
         char **ipauserauthtypes;
         char *other;
     } user;
@@ -106,6 +112,9 @@ struct otpd_queue_item {
         char *device_code_reply;
         krb5_data state;
     } oauth2;
+
+    bool get_passkey_config;
+    struct otpd_queue_item_passkey *passkey;
 
     int msgid;
 };
@@ -164,8 +173,13 @@ void otpd_log_err_(const char * const file, int line, krb5_error_code code,
 int add_krad_attr_to_set(krad_packet *req, krad_attrset *attrset,
                          krb5_data *datap, krad_attr attr, const char *message);
 
+int get_string(LDAP *ldp, LDAPMessage *entry, const char *name,
+               char **out);
+
 krb5_error_code otpd_queue_item_new(krad_packet *req,
                                     struct otpd_queue_item **item);
+
+void free_otpd_queue_item_passkey(struct otpd_queue_item *item);
 
 void otpd_queue_item_free(struct otpd_queue_item *item);
 
@@ -209,3 +223,10 @@ const char *otpd_parse_radius_username(LDAP *ldp, LDAPMessage *entry,
                                        struct otpd_queue_item *item);
 
 int oauth2(struct otpd_queue_item **item, enum oauth2_state);
+
+const char *otpd_parse_passkey(LDAP *ldp, LDAPMessage *entry,
+                               struct otpd_queue_item *item);
+
+int passkey_parse_data(const char *data, size_t size, struct otpd_queue_item *item);
+
+int do_passkey(struct otpd_queue_item *item);
