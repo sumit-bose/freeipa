@@ -26,6 +26,7 @@
 
 #define _GNU_SOURCE /* for asprintf() */
 #include <stdio.h>
+#include <fcntl.h>
 #include <jansson.h>
 #include <openssl/rand.h>
 #include <openssl/evp.h>
@@ -38,9 +39,9 @@ struct passkey_data {
     union {
         struct passkey_challenge {
             char *domain;
-            char **credential_id_list;
+            json_t *credential_id_list;
             int user_verification;
-            char *cryptographic_challenge;
+            unsigned char *cryptographic_challenge;
         } challenge;
 
         struct sss_passkey_reply {
@@ -62,22 +63,38 @@ struct otpd_queue_item_passkey {
     krb5_data state;
 };
 
+static void free_passkey_data(struct passkey_data *p)
+{
+    if (p == NULL) {
+        return;
+    }
+
+    free(p->state);
+    if (p->phase == 1) {
+        free(p->data.challenge.domain);
+        free(p->data.challenge.credential_id_list);
+        free(p->data.challenge.cryptographic_challenge);
+    }
+
+    if (p->phase == 2) {
+        free(p->data.response.credential_id);
+        free(p->data.response.cryptographic_challenge);
+        free(p->data.response.authenticator_data);
+        free(p->data.response.assertion_signature);
+    }
+
+    json_decref(p->jdata);
+    json_decref(p->jroot);
+    free(p);
+}
+
 void free_otpd_queue_item_passkey(struct otpd_queue_item *item)
 {
     free(item->passkey->domain);
     free(item->passkey->ipaRequireUserVerification);
 
-    if (item->passkey->data_in != NULL) {
-        json_decref(item->passkey->data_in->jdata);
-        json_decref(item->passkey->data_in->jroot);
-        free(item->passkey->data_in);
-    }
-
-    if (item->passkey->data_out != NULL) {
-        json_decref(item->passkey->data_out->jdata);
-        json_decref(item->passkey->data_out->jroot);
-        free(item->passkey->data_out);
-    }
+    free_passkey_data(item->passkey->data_in);
+    free_passkey_data(item->passkey->data_out);
 
     free(item->passkey);
 }
@@ -115,6 +132,7 @@ const char *otpd_parse_passkey(LDAP *ldp, LDAPMessage *entry,
                                struct otpd_queue_item *item)
 {
     int i;
+    char **objectclasses = NULL;
 
     if (item->passkey == NULL) {
         item->passkey = calloc(1, sizeof(struct otpd_queue_item_passkey));
@@ -123,11 +141,33 @@ const char *otpd_parse_passkey(LDAP *ldp, LDAPMessage *entry,
         }
     }
 
-    i = get_string(ldp, entry, "ipaRequireUserVerification",
-                   &item->passkey->ipaRequireUserVerification);
-    if ((i != 0) && (i != ENOENT)) {
-        return strerror(i);
-    }
+    while (entry != NULL) {
+        i = get_string_array(ldp, entry, "objectclass", &objectclasses);
+        if (i != 0) {
+            return strerror(i);
+        }
+
+        if (auth_type_is(objectclasses, "ipapasskeyconfigobject")) {
+            free(objectclasses);
+
+            i = get_string(ldp, entry, "ipaRequireUserVerification",
+                           &item->passkey->ipaRequireUserVerification);
+            if ((i != 0) && (i != ENOENT)) {
+                return strerror(i);
+            }
+        }
+        if (auth_type_is(objectclasses, "domainRelatedObject")) {
+            free(objectclasses);
+
+            i = get_string(ldp, entry, "associatedDomain",
+                           &item->passkey->domain);
+            if ((i != 0) && (i != ENOENT)) {
+                return strerror(i);
+            }
+        }
+
+        entry = ldap_next_entry(ldp, entry);
+    };
 
     return NULL;
 }
@@ -168,6 +208,7 @@ static int decode_json(const char *inp, size_t size, struct passkey_data *data)
                 "cryptographic_challenge", &data->data.response.cryptographic_challenge,
                 "authenticator_data", &data->data.response.authenticator_data,
                 "assertion_signature", &data->data.response.assertion_signature);
+        break;
     default:
         ret = EINVAL;
     }
@@ -236,6 +277,39 @@ done:
     return ja;
 }
 
+/* passkey string:
+ *     key_handle,public_key(,optional_user_id)
+ */
+static char *ipa_passkey_get_public_key(char **ipa_passkey, const char *key_id)
+{
+    char *sep;
+    char *sep2;
+    size_t c;
+
+    if (ipa_passkey == NULL || *ipa_passkey == NULL
+                            || key_id == NULL || *key_id == '\0') {
+        return NULL;
+    }
+
+    for (c = 0; ipa_passkey[c] != NULL; c++) {
+        sep = strchr(ipa_passkey[c], ',');
+        if (sep == NULL || sep == ipa_passkey[c]) {
+            return NULL;
+        }
+
+        if (strncmp(ipa_passkey[c], key_id, sep - ipa_passkey[c]) == 0) {
+            sep2 = strchrnul(sep + 1, ',');
+            if (sep2 == sep + 1) {
+                return NULL;
+            }
+            *sep2 = '\0';
+            return (sep + 1);
+        }
+    }
+
+    return NULL;
+}
+
 #define CHALLENGE_LENGTH 32
 static unsigned char *get_b64_challenge(void)
 {
@@ -268,50 +342,45 @@ static int prepare_rad_reply(struct otpd_queue_item *item)
     int ret;
     json_t *jtmp = NULL;
     char *stmp = NULL;
-    struct otpd_queue_item *state_item = NULL;
-
-    ret = otpd_queue_item_new(NULL, &state_item);
-    if (ret != 0) {
-        otpd_log_req(item->req, "Failed to allocate state item");
-        goto done;
-    }
+    krb5_data data = { 0 };
 
     ret = krad_attrset_new(ctx.kctx, &attrset);
     if (ret != 0) {
-        otpd_log_req(item->req, "Failed to create radius attribute set");
+        otpd_log_err(ret, "Failed to create radius attribute set");
         goto done;
     }
 
-    state_item->passkey->state.magic = 0;
-
-    jtmp = json_pack("{s:i, s:s, s:o}", item->passkey->data_out->phase,
-                                        item->passkey->data_out->state,
-                                        item->passkey->data_out->jdata);
+    jtmp = json_pack("{s:i, s:s, s:o}", "phase", item->passkey->data_out->phase,
+                                        "state", item->passkey->data_out->state,
+                                        "data", item->passkey->data_out->jdata);
     if (jtmp == NULL) {
-        otpd_log_req(item->req, "Failed to pack json reply");
         ret = EIO;
+        otpd_log_err(ret, "Failed to pack JSON reply");
         goto done;
     }
 
     stmp = json_dumps(jtmp, JSON_COMPACT);
     if (stmp == NULL) {
-        otpd_log_req(item->req, "json_dumps() failed");
         ret = EIO;
+        otpd_log_err(ret, "Failed to dump JSON string");
         goto done;
     }
 
-    ret = asprintf(&(state_item->passkey->state.data), "passkey %s", stmp);
+    ret = asprintf(&(data.data), "passkey %s", stmp);
     if (ret < 0) {
-        otpd_log_req(item->req, "asprintf() failed");
         ret = ENOMEM;
+        otpd_log_err(ret, "Failed to generate reply string");
         goto done;
     }
-    state_item->passkey->state.length = strlen(state_item->passkey->state.data);
+    data.length = strlen(data.data);
+    data.magic = 0;
 
-    ret = add_krad_attr_to_set(item->req, attrset, &(state_item->passkey->state),
+
+    ret = add_krad_attr_to_set(item->req, attrset, &data,
                                krad_attr_name2num("Proxy-State"),
                                "Failed to serialize state to attribute set");
     if (ret != 0) {
+        otpd_log_err(ret, "Failed to add Proxy-State");
         goto done;
     }
 
@@ -324,8 +393,6 @@ static int prepare_rad_reply(struct otpd_queue_item *item)
         item->rsp = NULL;
     }
 
-    otpd_queue_push(&ctx.oauth2_state.states, state_item);
-
     ret = 0;
 
 done:
@@ -334,11 +401,7 @@ done:
     json_decref(jtmp);
 
     if (ret != 0) {
-        if (state_item != NULL) {
-            free(state_item->oauth2.state.data);
-            free(state_item->oauth2.device_code_reply);
-            free(state_item);
-        }
+        free(data.data);
     }
 
     return ret;
@@ -346,41 +409,47 @@ done:
 
 static int do_passkey_challenge(struct otpd_queue_item *item)
 {
-    json_t *cred_id_list;
-    int user_verification = 1;
     unsigned char *challenge = NULL;
     int ret;
+    struct passkey_data *d;
 
-    cred_id_list = ipa_passkey_to_json_array(item->user.ipaPassKey);
-    if (cred_id_list == NULL) {
+    d = item->passkey->data_out;
+
+    d->data.challenge.credential_id_list = ipa_passkey_to_json_array(
+                                                         item->user.ipaPassKey);
+    if (d->data.challenge.credential_id_list == NULL) {
         return EINVAL;
     }
 
+    d->data.challenge.user_verification = -1;
     if (item->passkey->ipaRequireUserVerification == NULL || 
             strcasecmp(item->passkey->ipaRequireUserVerification, "default") == 0) {
-        user_verification = -1;
+        d->data.challenge.user_verification = -1;
     } else if (strcasecmp(item->passkey->ipaRequireUserVerification, "off") == 0) {
-        user_verification = 0;
+        d->data.challenge.user_verification = 0;
     }
 
-    challenge = get_b64_challenge();
-    if (challenge == NULL) {
+    d->data.challenge.cryptographic_challenge = get_b64_challenge();
+    if (d->data.challenge.cryptographic_challenge == NULL) {
         ret = ENOMEM;
         goto done;
     }
 
-    item->passkey->data_out->jdata = json_pack("{s:s, s:o, s:i, s:s}",
-                                       "domain", item->passkey->domain,
-                                       "credential_id_list", cred_id_list,
-                                       "user_verification", user_verification,
-                                       "cryptographic_challenge", challenge);
-    if (item->passkey->data_out->jdata == NULL) {
+    d->jdata = json_pack("{s:s, s:o, s:i, s:s}",
+                                     "domain", item->passkey->domain,
+                                     "credential_id_list",
+                                     d->data.challenge.credential_id_list,
+                                     "user_verification",
+                                     d->data.challenge.user_verification,
+                                     "cryptographic_challenge",
+                                     d->data.challenge.cryptographic_challenge);
+    if (d->jdata == NULL) {
         ret = EIO;
         goto done;
     }
                     
-    item->passkey->data_out->phase = 1; /* SSS_PASSKEY_PHASE_CHALLENGE */
-    item->passkey->data_out->state = "STATE";
+    d->phase = 1; /* SSS_PASSKEY_PHASE_CHALLENGE */
+    d->state = strdup("ipa_otpd state");
 
     ret = prepare_rad_reply(item);
     if (ret != 0) {
@@ -401,9 +470,239 @@ done:
     return ret;
 }
 
+struct child_ctx {
+    int read_from_child;
+    int write_to_child;
+    verto_ev *read_ev;
+    verto_ev *write_ev;
+    verto_ev *child_ev;
+    struct otpd_queue_item *item;
+};
+
+static void passkey_on_child_writable(verto_ctx *vctx, verto_ev *ev)
+{
+    (void)vctx; /* Unused */
+
+    /* no input needed */
+    verto_del(ev);
+    return;
+}
+
+static void passkey_on_child_readable(verto_ctx *vctx, verto_ev *ev)
+{
+    (void)vctx; /* Unused */
+
+    /* no output expected */
+    verto_del(ev);
+    return;
+}
+
+static void passkey_on_child_exit(verto_ctx *vctx, verto_ev *ev)
+{
+    (void)vctx; /* Unused */
+    int ret;
+    verto_proc_status st;
+    struct child_ctx *child_ctx = NULL;
+
+    child_ctx = (struct child_ctx *) verto_get_private(ev);
+    if (child_ctx == NULL) {
+        otpd_log_err(EINVAL, "Lost child context");
+        verto_del(ev);
+        return;
+    }
+
+    /* Make sure ctx.stdio.responses will at least return an error */
+    child_ctx->item->rsp = NULL;
+    child_ctx->item->sent = 0;
+
+    st = verto_get_proc_status(ev);
+
+    if (!WIFEXITED(st)) {
+        otpd_log_err(0, "Child didn't exit normally.");
+        verto_del(ev);
+        goto done;
+    }
+
+    /* The krad req might not be available at this stage anymore, so
+     * otpd_log_err() is used. */
+    otpd_log_err(0, "Child finished with status [%d].", WEXITSTATUS(st));
+
+    verto_del(ev);
+
+    if (WEXITSTATUS(st) != 0) {
+        /* verification failed */
+        goto done;
+    }
+
+    ret = krad_packet_new_response(ctx.kctx, SECRET,
+                                   krad_code_name2num("Access-Accept"), NULL,
+                                   child_ctx->item->req, &child_ctx->item->rsp);
+    if (ret != 0) {
+        otpd_log_err(ret, "Failed to create radius response");
+        child_ctx->item->rsp = NULL;
+    }
+
+done:
+    otpd_queue_push(&ctx.stdio.responses, child_ctx->item);
+    verto_set_flags(ctx.stdio.writer, VERTO_EV_FLAG_PERSIST |
+                                      VERTO_EV_FLAG_IO_ERROR |
+                                      VERTO_EV_FLAG_IO_READ |
+                                      VERTO_EV_FLAG_IO_WRITE);
+}
+
+static void free_child_ctx(verto_ctx *vctx, verto_ev *ev)
+{
+    (void)vctx; /* Unused */
+    struct child_ctx *child_ctx;
+
+    child_ctx = verto_get_private(ev);
+
+    free(child_ctx);
+}
+
+static int set_fd_nonblocking(int fd)
+{
+    int flags;
+    int ret;
+
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) {
+        ret = errno;
+        return ret;
+    }
+
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        ret = errno;
+        return ret;
+    }
+
+    return 0;
+}
+
+#define PASSKEY_CHILD_PATH "/usr/libexec/sssd/passkey_child"
+
 static int do_passkey_response(struct otpd_queue_item *item)
 {
-    return ENOTSUP;
+    int ret;
+    pid_t child_pid;
+    int pipefd_to_child[2] = { -1, -1};
+    int pipefd_from_child[2] = { -1, -1};
+    /* Up to 50 arguments to the helper supported. The amount of arguments
+     * is controlled inside this function. Right now max used is below 20 */
+    char *args[50] = {NULL};
+    size_t args_idx = 0;
+    struct child_ctx *child_ctx;
+    char *pk = NULL;
+
+    child_ctx = calloc(sizeof(struct child_ctx), 1);
+    if (child_ctx == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+    child_ctx->item = item;
+
+    pk = ipa_passkey_get_public_key(item->user.ipaPassKey,
+                           item->passkey->data_in->data.response.credential_id);
+    if (pk == NULL) {
+        ret = EINVAL;
+        otpd_log_err(ret, "No matching public key found for [%s]",
+                     item->passkey->data_in->data.response.credential_id);
+        goto done;
+    }
+
+    args[args_idx++] = PASSKEY_CHILD_PATH;
+    args[args_idx++] = "--verify-assert";
+    args[args_idx++] = "--domain";
+    args[args_idx++] = item->passkey->domain;
+    args[args_idx++] = "--key-handle";
+    args[args_idx++] = item->passkey->data_in->data.response.credential_id;
+    args[args_idx++] = "--public-key";
+    args[args_idx++] = pk;
+    args[args_idx++] = "--cryptographic_challenge";
+    args[args_idx++] = item->passkey->data_in->data.response.cryptographic_challenge;
+    args[args_idx++] = "--auth-data";
+    args[args_idx++] = item->passkey->data_in->data.response.authenticator_data;
+    args[args_idx++] = "--signature";
+    args[args_idx++] = item->passkey->data_in->data.response.assertion_signature;
+
+    ret = pipe(pipefd_from_child);
+    if (ret == -1) {
+        ret = errno;
+        goto done;
+    }
+    ret = pipe(pipefd_to_child);
+    if (ret == -1) {
+        ret = errno;
+        goto done;
+    }
+
+    child_pid = fork();
+
+    if (child_pid == 0) { /* child */
+        close(pipefd_to_child[1]);
+        ret = dup2(pipefd_to_child[0], STDIN_FILENO);
+        if (ret == -1) {
+            exit(EXIT_FAILURE);
+        }
+
+        close(pipefd_from_child[0]);
+        ret = dup2(pipefd_from_child[1], STDOUT_FILENO);
+        if (ret == -1) {
+            exit(EXIT_FAILURE);
+        }
+
+        execv(args[0], args);
+        exit(EXIT_FAILURE);
+    } else if (child_pid > 0) { /* parent */
+        close(pipefd_to_child[0]);
+        set_fd_nonblocking(pipefd_to_child[1]);
+        child_ctx->write_to_child = pipefd_to_child[1];
+
+        close(pipefd_from_child[1]);
+        set_fd_nonblocking(pipefd_from_child[0]);
+        child_ctx->read_from_child = pipefd_from_child[0];
+
+        child_ctx->write_ev = verto_add_io(ctx.vctx, VERTO_EV_FLAG_PERSIST |
+                                                     VERTO_EV_FLAG_IO_CLOSE_FD |
+                                                     VERTO_EV_FLAG_IO_ERROR |
+                                                     VERTO_EV_FLAG_IO_WRITE,
+                                                     passkey_on_child_writable,
+                                                     child_ctx->write_to_child);
+        if (child_ctx->write_ev == NULL) {
+            ret = ENOMEM;
+            otpd_log_err(ret, "Unable to initialize oauth2 writer event");
+            goto done;
+        }
+        verto_set_private(child_ctx->write_ev, child_ctx, NULL);
+
+        child_ctx->read_ev = verto_add_io(ctx.vctx, VERTO_EV_FLAG_PERSIST |
+                                                    VERTO_EV_FLAG_IO_CLOSE_FD |
+                                                    VERTO_EV_FLAG_IO_ERROR |
+                                                    VERTO_EV_FLAG_IO_READ,
+                                                    passkey_on_child_readable,
+                                                    child_ctx->read_from_child);
+        if (child_ctx->read_ev == NULL) {
+            ret = ENOMEM;
+            otpd_log_err(ret, "Unable to initialize oauth2 writer event");
+            goto done;
+        }
+        verto_set_private(child_ctx->read_ev, child_ctx, NULL);
+
+        child_ctx->child_ev = verto_add_child(ctx.vctx, VERTO_EV_FLAG_NONE,
+                                              passkey_on_child_exit, child_pid);
+        verto_set_private(child_ctx->child_ev, child_ctx, free_child_ctx);
+
+    } else { /* error */
+        ret = errno;
+        otpd_log_err(ret, "Failed to fork oidc_child");
+        goto done;
+    }
+
+    ret = 0;
+
+done:
+
+    return ret;
 }
 
 int do_passkey(struct otpd_queue_item *item)

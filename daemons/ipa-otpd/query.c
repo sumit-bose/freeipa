@@ -43,6 +43,7 @@ static char *user[] = {
     "ipaidpSub",
     "ipaidpConfigLink",
     "ipauserauthtype",
+    "ipapasskey",
     NULL
 };
 
@@ -69,7 +70,7 @@ static char *idp[] = {
     NULL
 };
 
-static bool auth_type_is(char **auth_types, const char *check)
+bool auth_type_is(char **auth_types, const char *check)
 {
     size_t c;
 
@@ -117,7 +118,7 @@ static bool is_passkey(struct otpd_queue_item *item)
     return false;
 }
 
-#define PASSKEY_CONFIG_FILTER "(objectclass=ipapasskeyconfigobject)"
+#define PASSKEY_CONFIG_FILTER "(|(objectclass=ipapasskeyconfigobject)(&(objectclass=domain)(objectclass=domainRelatedObject)))"
 
 /* Send queued LDAP requests to the server. */
 static void on_query_writable(verto_ctx *vctx, verto_ev *ev)
@@ -160,7 +161,7 @@ static void on_query_writable(verto_ctx *vctx, verto_ev *ev)
         item->ldap_query = LDAP_QUERY_PASSKEY;
 
         i = ldap_search_ext(verto_get_private(ev), ctx.query.base,
-                            LDAP_SCOPE_SUBTREE, PASSKEY_CONFIG_FILTER, user, 0, NULL,
+                            LDAP_SCOPE_SUBTREE, PASSKEY_CONFIG_FILTER, NULL, 0, NULL,
                             NULL, NULL, 1, &item->msgid);
 
     } else if (auth_type_is(item->user.ipauserauthtypes, "idp")) {

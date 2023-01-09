@@ -61,6 +61,7 @@ static void free_elts(struct otpd_queue *q)
 
 void free_otpd_queue_item_passkey(struct otpd_queue_item *item)
 {
+    (void)item; /* Unused */
     return;
 }
 
