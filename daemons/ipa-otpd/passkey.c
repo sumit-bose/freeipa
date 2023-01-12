@@ -69,18 +69,9 @@ static void free_passkey_data(struct passkey_data *p)
         return;
     }
 
-    free(p->state);
     if (p->phase == 1) {
         free(p->data.challenge.domain);
-        free(p->data.challenge.credential_id_list);
         free(p->data.challenge.cryptographic_challenge);
-    }
-
-    if (p->phase == 2) {
-        free(p->data.response.credential_id);
-        free(p->data.response.cryptographic_challenge);
-        free(p->data.response.authenticator_data);
-        free(p->data.response.assertion_signature);
     }
 
     json_decref(p->jdata);
@@ -135,10 +126,9 @@ const char *otpd_parse_passkey(LDAP *ldp, LDAPMessage *entry,
     char **objectclasses = NULL;
 
     if (item->passkey == NULL) {
-        item->passkey = calloc(1, sizeof(struct otpd_queue_item_passkey));
-        if (item->passkey == NULL) {
-            return strerror(ENOMEM);
-        }
+        otpd_log_req(item->req,
+                     "Missing passkey struct to store passkey configuration");
+        return strerror(EINVAL);
     }
 
     while (entry != NULL) {
@@ -155,8 +145,7 @@ const char *otpd_parse_passkey(LDAP *ldp, LDAPMessage *entry,
             if ((i != 0) && (i != ENOENT)) {
                 return strerror(i);
             }
-        }
-        if (auth_type_is(objectclasses, "domainRelatedObject")) {
+        } else if (auth_type_is(objectclasses, "domainRelatedObject")) {
             free(objectclasses);
 
             i = get_string(ldp, entry, "associatedDomain",
@@ -216,7 +205,9 @@ static int decode_json(const char *inp, size_t size, struct passkey_data *data)
 done:
     if (ret != 0) {
         json_decref(data->jdata);
+        data->jdata = NULL;
         json_decref(data->jroot);
+        data->jroot = NULL;
     }
 
     return ret;
@@ -232,10 +223,13 @@ int passkey_parse_data(const char *data, size_t size, struct otpd_queue_item *it
     return decode_json(data, size, item->passkey->data_in);
 }
 
+#define PK_PREF "passkey:"
+
 static json_t *ipa_passkey_to_json_array(char **ipa_passkey)
 {
     int ret;
     const char *sep;
+    char *start;
     size_t c;
     json_t *ja = NULL;
     json_t *js;
@@ -250,13 +244,19 @@ static json_t *ipa_passkey_to_json_array(char **ipa_passkey)
     }
 
     for (c = 0; ipa_passkey[c] != NULL; c++) {
-        sep = strchr(ipa_passkey[c], ',');
-        if (sep == NULL || sep == ipa_passkey[c]) {
+        if (strncmp(ipa_passkey[c], PK_PREF, strlen(PK_PREF)) != 0) {
+            ret = EINVAL;
+            otpd_log_err(ret, "Missing prefix in [%s]", ipa_passkey[c]);
+            goto done;
+        }
+        start = ipa_passkey[c] + strlen(PK_PREF);
+        sep = strchr(start, ',');
+        if (sep == NULL || sep == start) {
             ret = EINVAL;
             goto done;
         }
 
-        js = json_stringn(ipa_passkey[c], sep - ipa_passkey[c]);
+        js = json_stringn(start, sep - ipa_passkey[c]);
         if (js == NULL) {
             ret = ENOMEM;
             goto done;
@@ -285,6 +285,7 @@ static char *ipa_passkey_get_public_key(char **ipa_passkey, const char *key_id)
     char *sep;
     char *sep2;
     size_t c;
+    char *start;
 
     if (ipa_passkey == NULL || *ipa_passkey == NULL
                             || key_id == NULL || *key_id == '\0') {
@@ -292,12 +293,19 @@ static char *ipa_passkey_get_public_key(char **ipa_passkey, const char *key_id)
     }
 
     for (c = 0; ipa_passkey[c] != NULL; c++) {
-        sep = strchr(ipa_passkey[c], ',');
-        if (sep == NULL || sep == ipa_passkey[c]) {
+        if (strncmp(ipa_passkey[c], PK_PREF, strlen(PK_PREF)) != 0) {
+            otpd_log_err(EINVAL, "Missing prefix in [%s]", ipa_passkey[c]);
+            return NULL;
+        }
+        start = ipa_passkey[c] + strlen(PK_PREF);
+
+        sep = strchr(start, ',');
+        if (sep == NULL || sep == start) {
+            otpd_log_err(EINVAL, "Missing seperator");
             return NULL;
         }
 
-        if (strncmp(ipa_passkey[c], key_id, sep - ipa_passkey[c]) == 0) {
+        if (strncmp(start, key_id, sep - start) == 0) {
             sep2 = strchrnul(sep + 1, ',');
             if (sep2 == sep + 1) {
                 return NULL;
@@ -618,7 +626,7 @@ static int do_passkey_response(struct otpd_queue_item *item)
     args[args_idx++] = item->passkey->data_in->data.response.credential_id;
     args[args_idx++] = "--public-key";
     args[args_idx++] = pk;
-    args[args_idx++] = "--cryptographic_challenge";
+    args[args_idx++] = "--cryptographic-challenge";
     args[args_idx++] = item->passkey->data_in->data.response.cryptographic_challenge;
     args[args_idx++] = "--auth-data";
     args[args_idx++] = item->passkey->data_in->data.response.authenticator_data;
@@ -701,6 +709,9 @@ static int do_passkey_response(struct otpd_queue_item *item)
     ret = 0;
 
 done:
+    if (ret != 0) {
+        free(child_ctx);
+    }
 
     return ret;
 }

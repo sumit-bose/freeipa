@@ -89,16 +89,72 @@ bool auth_type_is(char **auth_types, const char *check)
 
 #define PASSKEY_PREFIX "passkey "
 
+static const krb5_data *get_full_krad_attr(krad_packet *req, krad_attr attr)
+{
+    size_t c;
+    size_t idx;
+    const krb5_data *tmp;
+    krb5_data *data;
+
+    data = calloc(1, sizeof(krb5_data));
+    if (data == NULL) {
+        return NULL;
+    }
+
+    c = 0;
+    do {
+        tmp = krad_packet_get_attr(req, attr, c);
+        if (tmp != NULL) {
+            data->length += tmp->length;
+        }
+        c++;
+    } while (tmp != NULL);
+
+    if (data->length == 0) {
+        free(data);
+        return NULL;
+    }
+
+    data->data = malloc(data->length);
+    if (data->data == NULL) {
+        free(data);
+        return NULL;
+    }
+
+    c = 0;
+    idx = 0;
+    do {
+        tmp = krad_packet_get_attr(req, attr, c);
+        if (tmp != NULL) {
+            memcpy(data->data + idx, tmp->data, tmp->length);
+            idx += tmp->length;
+        }
+        c++;
+    } while (tmp != NULL);
+
+    if (idx != data->length) {
+        free(data->data);
+        free(data);
+        return NULL;
+    }
+
+    return data;
+}
+
 static bool is_passkey(struct otpd_queue_item *item)
 {
     const krb5_data *data_pwd;
     const krb5_data *data_state;
     int ret;
 
+    if (item->passkey != NULL) {
+        return true;
+    }
+
     data_pwd = krad_packet_get_attr(item->req,
                                     krad_attr_name2num("User-Password"), 0);
-    data_state = krad_packet_get_attr(item->req,
-                                      krad_attr_name2num("Proxy-State"), 0);
+    data_state = get_full_krad_attr(item->req,
+                                    krad_attr_name2num("Proxy-State"));
 
     if (data_pwd == NULL && data_state != NULL
             && data_state->length > strlen(PASSKEY_PREFIX)
@@ -162,7 +218,7 @@ static void on_query_writable(verto_ctx *vctx, verto_ev *ev)
 
         i = ldap_search_ext(verto_get_private(ev), ctx.query.base,
                             LDAP_SCOPE_SUBTREE, PASSKEY_CONFIG_FILTER, NULL, 0, NULL,
-                            NULL, NULL, 1, &item->msgid);
+                            NULL, NULL, 0, &item->msgid);
 
     } else if (auth_type_is(item->user.ipauserauthtypes, "idp")) {
         otpd_log_req(item->req, "idp query start: %s",
